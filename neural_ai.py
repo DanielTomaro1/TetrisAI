@@ -1,23 +1,22 @@
 import torch
 import torch.nn as nn
-import torch.optim as optim
 import numpy as np
 import random
-from collections import deque
+import copy
 from tetromino import TETROMINOES
 
 class TetrisNet(nn.Module):
     def __init__(self):
         super(TetrisNet, self).__init__()
         
-        # State dimensionality: heights + holes + lines + bumpiness + max_height + avg_height + total_holes
+        # State dimensionality
         input_size = 10 + 10 + 22 + 9 + 3  # 54 features total
         
-        # Match the architecture of the saved model
+        # Network architecture
         self.fc1 = nn.Linear(input_size, 256)
         self.fc2 = nn.Linear(256, 128)
         self.fc3 = nn.Linear(128, 128)
-        self.fc4 = nn.Linear(128, 80)
+        self.fc4 = nn.Linear(128, 80)  # Output size for possible moves
         
         # Add batch normalization
         self.bn1 = nn.BatchNorm1d(256)
@@ -25,29 +24,23 @@ class TetrisNet(nn.Module):
         self.bn3 = nn.BatchNorm1d(128)
         
         self.relu = nn.ReLU()
-        self.dropout = nn.Dropout(0.1)
         
-        # Initialize weights
+        # Initialize weights with Xavier/Glorot initialization
         nn.init.xavier_uniform_(self.fc1.weight)
         nn.init.xavier_uniform_(self.fc2.weight)
         nn.init.xavier_uniform_(self.fc3.weight)
         nn.init.xavier_uniform_(self.fc4.weight)
 
     def forward(self, x):
-        if self.training:
-            x = x + torch.randn_like(x) * 0.01
-            
         x = self.fc1(x)
         if x.size(0) > 1:
             x = self.bn1(x)
         x = self.relu(x)
-        x = self.dropout(x)
         
         x = self.fc2(x)
         if x.size(0) > 1:
             x = self.bn2(x)
         x = self.relu(x)
-        x = self.dropout(x)
         
         x = self.fc3(x)
         if x.size(0) > 1:
@@ -57,94 +50,37 @@ class TetrisNet(nn.Module):
         x = self.fc4(x)
         return x
 
-class TetrisAI:
-    def __init__(self):
+class GeneticTetrisAI:
+    def __init__(self, population_size=30):
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         print(f"Using device: {self.device}")
         
-        self.model = TetrisNet().to(self.device)
-        self.target_model = TetrisNet().to(self.device)
-        self.target_model.load_state_dict(self.model.state_dict())
+        # Population parameters
+        self.population_size = population_size
+        self.generation = 0
+        self.population = [TetrisNet().to(self.device) for _ in range(population_size)]
+        self.current_member = 0
         
-        self.optimizer = optim.Adam(self.model.parameters(), lr=0.0001)
-        self.scheduler = optim.lr_scheduler.ReduceLROnPlateau(
-            self.optimizer, mode='max', factor=0.5, patience=5, verbose=True
-        )
-        self.criterion = nn.HuberLoss()
+        # Genetic parameters
+        self.mutation_rate = 0.1
+        self.mutation_strength = 0.2
+        self.elite_size = 2
         
-        self.memory = deque(maxlen=50000)
-        self.batch_size = 64
+        # Fitness tracking
+        self.fitness_scores = []
+        self.best_fitness = float('-inf')
+        self.best_network = None
         
-        self.epsilon = 1.0
-        self.epsilon_min = 0.01
-        self.epsilon_decay = 0.9995
-        self.gamma = 0.99
-        
-        self.target_update = 5
-        self.episode_count = 0
-        self.latest_loss = 0
-        self.latest_q_value = 0
-        
-        self.training_stats = {
-            'episode_rewards': [],
-            'episode_lengths': [],
-            'q_values': [],
-            'losses': [],
-            'epsilons': []
+        # Statistics
+        self.generation_stats = {
+            'best_fitness': [],
+            'avg_fitness': [],
+            'worst_fitness': [],
+            'generation_best_network': None
         }
         
-        self.priority_alpha = 0.6
-        self.priority_beta = 0.4
-        self.priority_beta_increment = 0.001
-        
-        print("Neural network initialized with trainable parameters:",
-              sum(p.numel() for p in self.model.parameters() if p.requires_grad))
-
-    @staticmethod
-    def count_connections(grid, position, tetromino):
-        """Count how many sides of the tetromino connect with existing pieces."""
-        connections = 0
-        x, y = position
-        
-        for i in range(len(tetromino)):
-            for j in range(len(tetromino[i])):
-                if tetromino[i][j] != 0:
-                    for dx, dy in [(0,1), (0,-1), (1,0), (-1,0)]:
-                        new_x, new_y = x + j + dx, y + i + dy
-                        if (0 <= new_x < grid.shape[1] and 
-                            0 <= new_y < grid.shape[0] and 
-                            grid[new_y][new_x] != 0):
-                            connections += 1
-        return connections
-    
-    @staticmethod
-    def count_gaps_filled(grid, position, tetromino):
-        """Count how many gaps the tetromino fills."""
-        gaps_filled = 0
-        x, y = position
-        
-        for i in range(len(tetromino)):
-            for j in range(len(tetromino[i])):
-                if tetromino[i][j] != 0:
-                    if TetrisAI.is_filling_gap(grid, x + j, y + i):
-                        gaps_filled += 1
-        return gaps_filled
-
-    @staticmethod
-    def is_filling_gap(grid, x, y):
-        """Check if a position represents a gap that should be filled."""
-        if y >= grid.shape[0] - 1:
-            return False
-            
-        adjacent_blocks = 0
-        for dx, dy in [(0,1), (0,-1), (1,0), (-1,0)]:
-            new_x, new_y = x + dx, y + dy
-            if (0 <= new_x < grid.shape[1] and 
-                0 <= new_y < grid.shape[0] and 
-                grid[new_y][new_x] != 0):
-                adjacent_blocks += 1
-        
-        return adjacent_blocks >= 2
+        print(f"Genetic AI initialized with population size: {population_size}")
+        print(f"Network parameters: ", sum(p.numel() for p in self.population[0].parameters()))
 
     def get_state(self, grid, tetromino, position):
         heights = self._get_heights(grid)
@@ -156,6 +92,7 @@ class TetrisAI:
         avg_height = np.mean(heights)
         total_holes = np.sum(holes)
         
+        # Normalize features
         heights = heights / grid.shape[0]
         holes = holes / max(1, max_height)
         lines = lines / grid.shape[1]
@@ -171,96 +108,9 @@ class TetrisAI:
              total_holes / (grid.shape[0] * grid.shape[1])]
         ])
         
+        
         return torch.FloatTensor(state_features).unsqueeze(0).to(self.device)
-
-    def choose_action(self, state, possible_moves, grid, tetromino_key, tetromino):
-        if not possible_moves:
-            return None
-        
-        if random.random() < self.epsilon:
-            move_scores = []
-            for rotation_index, position in possible_moves:
-                current_tetromino = TETROMINOES[tetromino_key][rotation_index]
-                connections = self.count_connections(grid, position, current_tetromino)
-                gaps_filled = self.count_gaps_filled(grid, position, current_tetromino)
-                score = connections * 2 + gaps_filled * 3
-                move_scores.append((score, rotation_index, position))
-            
-            top_moves = sorted(move_scores, reverse=True)[:3]
-            _, rotation_index, position = random.choice(top_moves)
-            print(f"Exploration move chosen: rot={rotation_index}, pos={position}")
-            return (rotation_index, position)
-        
-        with torch.no_grad():
-            q_values = self.model(state)
-            self.latest_q_value = q_values.max().item()
-            
-            combined_scores = []
-            for i, (rotation_index, position) in enumerate(possible_moves):
-                current_tetromino = TETROMINOES[tetromino_key][rotation_index]
-                connections = self.count_connections(grid, position, current_tetromino)
-                gaps_filled = self.count_gaps_filled(grid, position, current_tetromino)
-                
-                q_value = q_values[0][i].item() if i < q_values.size(1) else 0
-                connection_score = connections * 2 + gaps_filled * 3
-                combined_score = q_value * 0.7 + connection_score * 0.3
-                
-                combined_scores.append((combined_score, rotation_index, position))
-            
-            best_score, rotation_index, position = max(combined_scores)
-            print(f"Exploitation move chosen: rot={rotation_index}, pos={position}, score={best_score:.2f}")
-            return (rotation_index, position)
-
-    def train(self, state, action, reward, next_state, done):
-        action = min(action, self.model.fc4.out_features - 1)
-        priority = 1.0
-        self.memory.append((state, action, reward, next_state, done, priority))
-        
-        if len(self.memory) < self.batch_size:
-            return
-            
-        priorities = np.array([exp[5] for exp in self.memory])
-        probs = priorities ** self.priority_alpha
-        probs /= probs.sum()
-        
-        indices = np.random.choice(len(self.memory), self.batch_size, p=probs)
-        batch = [self.memory[idx] for idx in indices]
-        states, actions, rewards, next_states, dones, _ = zip(*batch)
-        
-        states = torch.cat(states)
-        next_states = torch.cat(next_states)
-        actions = torch.tensor(actions, dtype=torch.long).to(self.device)
-        rewards = torch.tensor(rewards, dtype=torch.float32).to(self.device)
-        dones = torch.tensor(dones, dtype=torch.float32).to(self.device)
-        
-        self.model.train()
-        current_q = self.model(states)
-        current_q = current_q.gather(1, actions.unsqueeze(1))
-        
-        with torch.no_grad():
-            self.target_model.eval()
-            next_q = self.target_model(next_states)
-            max_next_q = next_q.max(1)[0]
-            target_q = rewards + (1 - dones) * self.gamma * max_next_q
-        
-        loss = self.criterion(current_q.squeeze(), target_q)
-        self.latest_loss = loss.item()
-        
-        self.optimizer.zero_grad()
-        loss.backward()
-        torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
-        self.optimizer.step()
-        
-        with torch.no_grad():
-            td_errors = abs(current_q.squeeze() - target_q).cpu().numpy()
-            for idx, error in zip(indices, td_errors):
-                self.memory[idx] = (*self.memory[idx][:-1], error)
-        
-        if len(self.training_stats['losses']) % 100 == 0:
-            self.print_training_stats()
-        
-        self.epsilon = max(self.epsilon_min, self.epsilon * self.epsilon_decay)
-
+    
     def _get_heights(self, grid):
         heights = []
         for x in range(grid.shape[1]):
@@ -297,58 +147,218 @@ class TetrisAI:
         return np.array([abs(heights[i] - heights[i+1]) 
                         for i in range(len(heights)-1)])
 
-    def update_target_network(self):
-        self.episode_count += 1
-        if self.episode_count % self.target_update == 0:
-            self.target_model.load_state_dict(self.model.state_dict())
-            print(f"Target network updated at episode {self.episode_count}")
-
-    def save_model(self, path, best_score=0):
-        torch.save({
-            'model_state_dict': self.model.state_dict(),
-            'optimizer_state_dict': self.optimizer.state_dict(),
-            'scheduler_state_dict': self.scheduler.state_dict(),
-            'epsilon': self.epsilon,
-            'episode_count': self.episode_count,
-            'memory': list(self.memory),
-            'training_stats': self.training_stats,
-            'best_score': best_score
-        }, path)
-        print(f"Model saved to {path} with best score: {best_score}")
-
-    def load_model(self, path):
-        checkpoint = torch.load(path)
-        self.model.load_state_dict(checkpoint['model_state_dict'])
-        self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-        self.scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
-        self.epsilon = checkpoint['epsilon']
-        self.episode_count = checkpoint['episode_count']
-        self.memory = deque(checkpoint.get('memory', []), maxlen=50000)
-        self.training_stats = checkpoint.get('training_stats', self.training_stats)
-        self.target_model.load_state_dict(self.model.state_dict())
-        print(f"Model loaded from {path}")
-
-    def get_latest_loss(self):
-        return self.latest_loss
-
-    def get_latest_q_value(self):
-        return self.latest_q_value
-    
-    def log_episode(self, total_reward, episode_length):
-        """Log statistics for the completed episode."""
-        self.training_stats['episode_rewards'].append(total_reward)
-        self.training_stats['episode_lengths'].append(episode_length)
-        self.training_stats['q_values'].append(self.latest_q_value)
-        self.training_stats['losses'].append(self.latest_loss)
-        self.training_stats['epsilons'].append(self.epsilon)
+    @staticmethod
+    def count_connections(grid, position, tetromino):
+        """Count how many sides of the tetromino connect with existing pieces."""
+        connections = 0
+        x, y = position
         
-        # Print progress every 10 episodes
-        if len(self.training_stats['episode_rewards']) % 10 == 0:
-            recent_rewards = self.training_stats['episode_rewards'][-10:]
-            recent_lengths = self.training_stats['episode_lengths'][-10:]
-            print("\nLast 10 Episodes Statistics:")
-            print(f"Average Reward: {np.mean(recent_rewards):.2f}")
-            print(f"Average Length: {np.mean(recent_lengths):.2f}")
-            print(f"Epsilon: {self.epsilon:.3f}")
-            print(f"Latest Loss: {self.latest_loss:.6f}")
-            print(f"Latest Q-Value: {self.latest_q_value:.6f}")
+        for i in range(len(tetromino)):
+            for j in range(len(tetromino[i])):
+                if tetromino[i][j] != 0:
+                    for dx, dy in [(0,1), (0,-1), (1,0), (-1,0)]:
+                        new_x, new_y = x + j + dx, y + i + dy
+                        if (0 <= new_x < grid.shape[1] and 
+                            0 <= new_y < grid.shape[0] and 
+                            grid[new_y][new_x] != 0):
+                            connections += 1
+        return connections
+
+    @staticmethod
+    def count_gaps_filled(grid, position, tetromino):
+        """Count how many gaps the tetromino fills."""
+        gaps_filled = 0
+        x, y = position
+        
+        for i in range(len(tetromino)):
+            for j in range(len(tetromino[i])):
+                if tetromino[i][j] != 0:
+                    if GeneticTetrisAI.is_filling_gap(grid, x + j, y + i):
+                        gaps_filled += 1
+        return gaps_filled
+
+    @staticmethod
+    def is_filling_gap(grid, x, y):
+        """Check if a position represents a gap that should be filled."""
+        if y >= grid.shape[0] - 1:
+            return False
+            
+        adjacent_blocks = 0
+        for dx, dy in [(0,1), (0,-1), (1,0), (-1,0)]:
+            new_x, new_y = x + dx, y + dy
+            if (0 <= new_x < grid.shape[1] and 
+                0 <= new_y < grid.shape[0] and 
+                grid[new_y][new_x] != 0):
+                adjacent_blocks += 1
+        
+        return adjacent_blocks >= 2
+
+    def choose_action(self, state, possible_moves, grid, tetromino_key, tetromino):
+        """Choose action using current network in population."""
+        if not possible_moves:
+            return None
+        
+        current_network = self.population[self.current_member]
+        with torch.no_grad():
+            q_values = current_network(state)
+            
+            # Evaluate each possible move
+            move_scores = []
+            for i, (rotation_index, position) in enumerate(possible_moves):
+                current_tetromino = TETROMINOES[tetromino_key][rotation_index]
+                
+                # Get base score from network
+                q_value = q_values[0][i].item() if i < q_values.size(1) else 0
+                
+                # Add heuristic components
+                connections = self.count_connections(grid, position, current_tetromino)
+                gaps_filled = self.count_gaps_filled(grid, position, current_tetromino)
+                
+                # Combine scores
+                total_score = (q_value * 0.6 + 
+                             connections * 0.2 + 
+                             gaps_filled * 0.2)
+                
+                move_scores.append((total_score, rotation_index, position))
+            
+            # Choose best move
+            best_score, rotation_index, position = max(move_scores)
+            print(f"Move chosen: rot={rotation_index}, pos={position}, score={best_score:.2f}")
+            return (rotation_index, position)
+
+    def evolve_population(self):
+        """Create next generation based on fitness scores."""
+        self.generation += 1
+        print(f"\nEvolving Generation {self.generation}")
+        
+        # Calculate statistics
+        avg_fitness = np.mean(self.fitness_scores)
+        best_gen_fitness = max(self.fitness_scores)
+        worst_gen_fitness = min(self.fitness_scores)
+        
+        # Update best network if we found a better one
+        best_idx = np.argmax(self.fitness_scores)
+        if best_gen_fitness > self.best_fitness:
+            self.best_fitness = best_gen_fitness
+            self.best_network = copy.deepcopy(self.population[best_idx])
+            self.generation_stats['generation_best_network'] = copy.deepcopy(self.population[best_idx])
+        
+        # Store generation statistics
+        self.generation_stats['best_fitness'].append(best_gen_fitness)
+        self.generation_stats['avg_fitness'].append(avg_fitness)
+        self.generation_stats['worst_fitness'].append(worst_gen_fitness)
+        
+        # Sort population by fitness
+        population_fitness = list(zip(self.population, self.fitness_scores))
+        population_fitness.sort(key=lambda x: x[1], reverse=True)
+        
+        # Create new population
+        new_population = []
+        
+        # Keep elite individuals
+        for i in range(self.elite_size):
+            new_population.append(copy.deepcopy(population_fitness[i][0]))
+        
+        # Fill rest of population with offspring
+        while len(new_population) < self.population_size:
+            # Tournament selection
+            parent1 = self._tournament_select(population_fitness)
+            parent2 = self._tournament_select(population_fitness)
+            
+            # Create and mutate offspring
+            child = self._crossover(parent1, parent2)
+            child = self._mutate(child)
+            new_population.append(child)
+        
+        # Update population
+        self.population = new_population
+        self.fitness_scores = []
+        self.current_member = 0
+        
+        print(f"Generation {self.generation} Stats:")
+        print(f"Best Fitness: {best_gen_fitness:.2f}")
+        print(f"Average Fitness: {avg_fitness:.2f}")
+        print(f"Worst Fitness: {worst_gen_fitness:.2f}")
+        print(f"All-time Best Fitness: {self.best_fitness:.2f}")
+
+    def _tournament_select(self, population_fitness, tournament_size=3):
+        """Select parent using tournament selection."""
+        tournament = random.sample(population_fitness, tournament_size)
+        return max(tournament, key=lambda x: x[1])[0]
+
+    def _crossover(self, parent1, parent2):
+        """Create child network through crossover."""
+        child = TetrisNet().to(self.device)
+        
+        # Uniform crossover for each parameter
+        for (name1, param1), (name2, param2) in zip(parent1.named_parameters(), 
+                                                   parent2.named_parameters()):
+            if random.random() < 0.5:
+                child.state_dict()[name1].copy_(param1)
+            else:
+                child.state_dict()[name1].copy_(param2)
+        return child
+
+    def _mutate(self, network):
+        """Apply random mutations to network parameters."""
+        for param in network.parameters():
+            if random.random() < self.mutation_rate:
+                mutation = torch.randn_like(param) * self.mutation_strength
+                param.data += mutation
+        return network
+
+    def add_fitness_score(self, score, moves, lines_cleared, max_height):
+        """Calculate and add fitness score for current member."""
+        fitness = (
+            score * 1.0 +           # Base score
+            lines_cleared * 100 +    # Lines cleared bonus
+            moves * 0.5 -           # Survival bonus
+            max_height * 10         # Height penalty
+        )
+        self.fitness_scores.append(fitness)
+        
+        # Move to next member of population
+        self.current_member += 1
+        
+        # If we've evaluated all members, evolve to next generation
+        if self.current_member >= self.population_size:
+            self.evolve_population()
+        
+        return fitness
+
+    def save_state(self, path):
+        """Save the current state of the genetic algorithm."""
+        torch.save({
+            'generation': self.generation,
+            'population': [net.state_dict() for net in self.population],
+            'best_network': self.best_network.state_dict() if self.best_network else None,
+            'best_fitness': self.best_fitness,
+            'generation_stats': self.generation_stats,
+            'current_member': self.current_member,
+            'fitness_scores': self.fitness_scores
+        }, path)
+        print(f"Genetic state saved to {path}")
+
+    def load_state(self, path):
+        """Load a previously saved state."""
+        checkpoint = torch.load(path)
+        
+        self.generation = checkpoint['generation']
+        self.current_member = checkpoint['current_member']
+        self.fitness_scores = checkpoint['fitness_scores']
+        self.best_fitness = checkpoint['best_fitness']
+        self.generation_stats = checkpoint['generation_stats']
+        
+        # Load population
+        self.population = []
+        for state_dict in checkpoint['population']:
+            net = TetrisNet().to(self.device)
+            net.load_state_dict(state_dict)
+            self.population.append(net)
+            
+        # Load best network if it exists
+        if checkpoint['best_network']:
+            self.best_network = TetrisNet().to(self.device)
+            self.best_network.load_state_dict(checkpoint['best_network'])
+            
+        print(f"Genetic state loaded from {path}")

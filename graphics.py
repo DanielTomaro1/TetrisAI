@@ -2,21 +2,11 @@ import pygame
 import numpy as np
 from collections import deque
 
-# Existing constants...
+# Constants
 WINDOW_WIDTH = 300
 WINDOW_HEIGHT = 660
-WINDOW_WIDTH_EXTENDED = WINDOW_WIDTH + 450  # Extended for metrics panel
+WINDOW_WIDTH_EXTENDED = WINDOW_WIDTH + 450
 CELL_SIZE = 30
-
-TETROMINO_COLORS = {
-    1: (0, 240, 240),     # Cyan for I
-    2: (240, 240, 0),     # Yellow for O
-    3: (160, 0, 240),     # Purple for T
-    4: (240, 160, 0),     # Orange for L
-    5: (0, 0, 240),       # Blue for J
-    6: (0, 240, 0),       # Green for S
-    7: (240, 0, 0)        # Red for Z
-}
 
 # Colors
 BLACK = (0, 0, 0)
@@ -28,26 +18,36 @@ GREEN = (0, 255, 0)
 RED = (255, 0, 0)
 YELLOW = (255, 255, 0)
 
+TETROMINO_COLORS = {
+    1: (0, 240, 240),     # Cyan for I
+    2: (240, 240, 0),     # Yellow for O
+    3: (160, 0, 240),     # Purple for T
+    4: (240, 160, 0),     # Orange for L
+    5: (0, 0, 240),       # Blue for J
+    6: (0, 240, 0),       # Green for S
+    7: (240, 0, 0)        # Red for Z
+}
+
 class MetricsVisualizer:
     def __init__(self, max_points=100):
         self.max_points = max_points
-        self.reward_history = deque(maxlen=max_points)
-        self.q_value_history = deque(maxlen=max_points)
-        self.loss_history = deque(maxlen=max_points)
         self.score_history = deque(maxlen=max_points)
+        self.fitness_history = deque(maxlen=max_points)
+        self.lines_history = deque(maxlen=max_points)
+        self.height_history = deque(maxlen=max_points)
         
         # Initialize with zeros
         for _ in range(max_points):
-            self.reward_history.append(0)
-            self.q_value_history.append(0)
-            self.loss_history.append(0)
             self.score_history.append(0)
+            self.fitness_history.append(0)
+            self.lines_history.append(0)
+            self.height_history.append(0)
 
-    def update(self, reward, q_value, loss, score):
-        self.reward_history.append(reward)
-        self.q_value_history.append(q_value)
-        self.loss_history.append(loss)
+    def update(self, score, fitness, lines, height):
         self.score_history.append(score)
+        self.fitness_history.append(fitness)
+        self.lines_history.append(lines)
+        self.height_history.append(height)
 
     def draw_graph(self, screen, data, position, size, color, title, min_val=None, max_val=None):
         x, y = position
@@ -81,16 +81,16 @@ class MetricsVisualizer:
         if len(points) > 1:
             pygame.draw.lines(screen, color, False, points, 2)
 
-def draw_metrics_panel(screen, metrics_visualizer, epsilon, episode_count, current_stats):
+def draw_metrics_panel(screen, metrics_visualizer, generation, member, population_size, current_stats):
     panel_x = WINDOW_WIDTH + 20
     panel_width = WINDOW_WIDTH_EXTENDED - WINDOW_WIDTH - 40
     
-    # Draw episode info
+    # Draw generation and member info
     font = pygame.font.Font(None, 30)
-    episode_text = font.render(f"Episode: {episode_count}", True, WHITE)
-    epsilon_text = font.render(f"Epsilon: {epsilon:.3f}", True, WHITE)
-    screen.blit(episode_text, (panel_x, 20))
-    screen.blit(epsilon_text, (panel_x, 50))
+    gen_text = font.render(f"Generation: {generation}", True, WHITE)
+    member_text = font.render(f"Member: {member}/{population_size}", True, WHITE)
+    screen.blit(gen_text, (panel_x, 20))
+    screen.blit(member_text, (panel_x, 50))
     
     # Draw current stats
     stats_y = 90
@@ -99,7 +99,8 @@ def draw_metrics_panel(screen, metrics_visualizer, epsilon, episode_count, curre
         f"Score: {current_stats.get('score', 0)}",
         f"Lines: {current_stats.get('lines', 0)}",
         f"Holes: {current_stats.get('holes', 0)}",
-        f"Height: {current_stats.get('height', 0):.1f}"
+        f"Height: {current_stats.get('height', 0):.1f}",
+        f"Fitness: {current_stats.get('fitness', 0):.1f}"
     ]
     
     for i, text in enumerate(stats_text):
@@ -111,41 +112,40 @@ def draw_metrics_panel(screen, metrics_visualizer, epsilon, episode_count, curre
     graph_width = panel_width
     metrics_visualizer.draw_graph(
         screen, 
-        metrics_visualizer.reward_history,
+        metrics_visualizer.score_history,
         (panel_x, 200),
         (graph_width, graph_height),
         GREEN,
-        "Reward"
+        "Score"
     )
     
     metrics_visualizer.draw_graph(
         screen, 
-        metrics_visualizer.q_value_history,
+        metrics_visualizer.fitness_history,
         (panel_x, 320),
         (graph_width, graph_height),
         BLUE,
-        "Q-Value"
+        "Fitness"
     )
     
     metrics_visualizer.draw_graph(
         screen, 
-        metrics_visualizer.loss_history,
+        metrics_visualizer.lines_history,
         (panel_x, 440),
         (graph_width, graph_height),
         RED,
-        "Loss"
+        "Lines"
     )
     
     metrics_visualizer.draw_graph(
         screen, 
-        metrics_visualizer.score_history,
+        metrics_visualizer.height_history,
         (panel_x, 560),
         (graph_width, graph_height),
         YELLOW,
-        "Score"
+        "Height"
     )
 
-# Keep existing drawing functions...
 def draw_grid(screen, grid):
     for y in range(len(grid)):
         for x in range(len(grid[y])):
