@@ -1,6 +1,8 @@
+import os
 import pygame
 import numpy as np
 import torch
+import time
 from grid import create_grid, is_valid_position, clear_tetromino_from_grid, place_tetromino_on_grid, check_completed_rows, clear_rows
 from tetromino import spawn_tetromino, TETROMINOES
 from graphics import (
@@ -8,8 +10,8 @@ from graphics import (
     draw_grid, draw_next_tetromino, draw_score, draw_game_over,
     MetricsVisualizer, draw_metrics_panel
 )
-from neural_ai import GeneticTetrisAI
-from statistics import GameStatistics
+from neural_ai import GeneticTetrisAI, NetworkConfig, GeneticConfig, LearningConfig
+from game_statistics import GameStatistics, TrainingMetrics
 
 def check_board_state(grid, tetromino, position):
     """Debug function to check the state of the board"""
@@ -45,6 +47,7 @@ def get_possible_moves(grid, tetromino_key, tetromino):
     return possible_moves
 
 def game_loop():
+    """Main game loop with improved state management and debugging"""
     # Initialize Pygame
     pygame.init()
     screen = pygame.display.set_mode((WINDOW_WIDTH_EXTENDED, WINDOW_HEIGHT))
@@ -52,41 +55,78 @@ def game_loop():
     clock = pygame.time.Clock()
     FPS = 60
 
+    # Initialize configurations
+    network_config = NetworkConfig()
+    genetic_config = GeneticConfig()
+    learning_config = LearningConfig()
+
     # Initialize Genetic AI
-    ai = GeneticTetrisAI(population_size=30)
+    ai = GeneticTetrisAI(
+        network_config=network_config,
+        genetic_config=genetic_config,
+        learning_config=learning_config
+    )
+    
+    # Try to load previous state
     try:
         ai.load_state('tetris_genetic_state.pth')
-        print("Loaded previous genetic state")
+        print(f"Loaded previous state - Generation: {ai.generation}, Member: {ai.current_member}")
     except FileNotFoundError:
-        print("Starting fresh genetic training")
+        print("Starting fresh training session")
+        ai.save_state('tetris_genetic_state.pth')  # Create initial save
     
+    # Initialize statistics and visualization
     metrics_visualizer = MetricsVisualizer()
+    stats = GameStatistics()
+    
     running = True
-    generation = ai.generation
+    session_start_time = time.time()
+    last_save_time = session_start_time
+
+    print(f"\nStarting training session:")
+    print(f"Generation: {ai.generation}")
+    print(f"Current Member: {ai.current_member + 1}/{ai.population_size}")
 
     while running:
-        # Initialize new game for current member of population
-        grid = create_grid()
-        tetromino_key, tetromino, rotation_index = spawn_tetromino()
-        next_tetromino_key, next_tetromino, _ = spawn_tetromino()
-        position = (grid.shape[1] // 2 - 2, 0)
-        score = 0
-        moves_made = 0
-        total_lines_cleared = 0
-        fitness = 0
-        game_over = False
+        # Initialize game state for current member
+        game_state = {
+            'grid': create_grid(),
+            'score': 0,
+            'moves': 0,
+            'lines_cleared': 0,
+            'max_height': 0,
+            'holes': 0,
+            'bumpiness': 0,
+            'last_move_time': pygame.time.get_ticks(),
+            'piece_stats': {
+                'total_pieces': 0,
+                'pieces_by_type': {}
+            }
+        }
 
-        print(f"\nGeneration {generation}, Member {ai.current_member + 1}/{ai.population_size}")
-        stats = GameStatistics()
-        check_board_state(grid, tetromino, position)
+        # Spawn initial pieces
+        current_piece = {
+            'key': None,
+            'tetromino': None,
+            'rotation': 0,
+            'position': (0, 0)
+        }
+        
+        next_piece = {
+            'key': None,
+            'tetromino': None,
+            'rotation': 0
+        }
 
-        # Animation timing
-        move_delay = 50  # Faster for genetic algorithm
-        last_move_time = pygame.time.get_ticks()
+        # Initial piece spawn
+        next_piece['key'], next_piece['tetromino'], next_piece['rotation'] = spawn_tetromino()
+        current_piece['key'], current_piece['tetromino'], current_piece['rotation'] = spawn_tetromino()
+        current_piece['position'] = (game_state['grid'].shape[1] // 2 - 2, 0)
 
-        while not game_over and running:
-            current_time = pygame.time.get_ticks()
-            
+        game_active = True
+        move_delay = 50  # Milliseconds between moves
+
+        while game_active and running:
             # Handle events
             for event in pygame.event.get():
                 if event.type == pygame.QUIT:
@@ -96,175 +136,183 @@ def game_loop():
                         running = False
                     elif event.key == pygame.K_s:
                         ai.save_state('tetris_genetic_state.pth')
-                        print("Genetic state saved")
-                    elif event.key == pygame.K_p:  # Pause
+                        print("Manual state save triggered")
+                    elif event.key == pygame.K_p:
                         paused = True
                         while paused and running:
                             for pause_event in pygame.event.get():
                                 if pause_event.type == pygame.QUIT:
                                     running = False
                                     paused = False
-                                elif pause_event.type == pygame.KEYDOWN:
-                                    if pause_event.key == pygame.K_p:
-                                        paused = False
+                                elif pause_event.type == pygame.KEYDOWN and pause_event.key == pygame.K_p:
+                                    paused = False
+                            pygame.display.flip()
                             clock.tick(FPS)
 
+            current_time = pygame.time.get_ticks()
+
             # AI move timing
-            if current_time - last_move_time > move_delay:
-                moves_made += 1
+            if current_time - game_state['last_move_time'] > move_delay:
+                game_state['moves'] += 1
                 
-                # Clear current tetromino from grid
-                clear_tetromino_from_grid(grid, tetromino, position)
+                # Clear current piece for movement
+                clear_tetromino_from_grid(game_state['grid'], current_piece['tetromino'], 
+                                        current_piece['position'])
                 
-                # Get current state and possible moves
-                state = ai.get_state(grid, tetromino, position)
-                possible_moves = get_possible_moves(grid, tetromino_key, tetromino)
-                
+                # Get AI move
+                state = ai.get_state(game_state['grid'], current_piece['tetromino'], 
+                                   current_piece['position'])
+                possible_moves = get_possible_moves(game_state['grid'], current_piece['key'], 
+                                                  current_piece['tetromino'])
+
                 if not possible_moves:
-                    print(f"No valid moves found for piece {tetromino_key}")
-                    game_over = True
+                    print(f"Game Over - No valid moves available")
+                    game_active = False
                     continue
 
                 # Get AI's chosen move
-                move = ai.choose_action(state, possible_moves, grid, tetromino_key, tetromino)
+                move = ai.choose_action(state, possible_moves, game_state['grid'],
+                                      current_piece['key'], current_piece['tetromino'])
+                
                 if move is None:
-                    print("AI couldn't choose a valid move")
-                    game_over = True
+                    print(f"Game Over - AI couldn't choose valid move")
+                    game_active = False
                     continue
-                    
-                rotation_index, target_position = move
-                tetromino = TETROMINOES[tetromino_key][rotation_index]
-                
-                # Verify and make the move
-                if not is_valid_position(grid, tetromino, target_position):
-                    print(f"Invalid move: {move}")
-                    game_over = True
+
+                # Apply move
+                rotation_index, new_position = move
+                current_piece['tetromino'] = TETROMINOES[current_piece['key']][rotation_index]
+                current_piece['position'] = new_position
+
+                if not is_valid_position(game_state['grid'], current_piece['tetromino'], 
+                                      current_piece['position']):
+                    print(f"Game Over - Invalid final position")
+                    game_active = False
                     continue
+
+                # Place piece and process results
+                place_tetromino_on_grid(game_state['grid'], current_piece['tetromino'], 
+                                      current_piece['position'])
                 
-                position = target_position
-                place_tetromino_on_grid(grid, tetromino, position)
-                
-                # Process completed rows
-                completed_rows = check_completed_rows(grid)
-                lines_cleared = len(completed_rows) if completed_rows else 0
-                total_lines_cleared += lines_cleared
+                # Check for completed rows
+                completed_rows = check_completed_rows(game_state['grid'])
                 if completed_rows:
-                    score += lines_cleared * 100
-                    grid = clear_rows(grid, completed_rows)
+                    lines_cleared = len(completed_rows)
+                    game_state['lines_cleared'] += lines_cleared
+                    game_state['score'] += lines_cleared * 100
+                    game_state['grid'] = clear_rows(game_state['grid'], completed_rows)
 
-                # Calculate metrics
-                heights = []
-                for x in range(grid.shape[1]):
-                    col = grid[:, x]
-                    for y in range(len(col)):
-                        if col[y] != 0:
-                            heights.append(grid.shape[0] - y)
-                            break
-                    if len(heights) < x + 1:
-                        heights.append(0)
-                
-                current_height = max(heights)
-                
-                # Count holes
-                current_holes = 0
-                for x in range(grid.shape[1]):
-                    col = grid[:, x]
-                    block_found = False
-                    for y in range(len(col)):
-                        if col[y] != 0:
-                            block_found = True
-                        elif block_found and col[y] == 0:
-                            current_holes += 1
+                # Update piece statistics
+                game_state['piece_stats']['total_pieces'] += 1
+                game_state['piece_stats']['pieces_by_type'][current_piece['key']] = \
+                    game_state['piece_stats']['pieces_by_type'].get(current_piece['key'], 0) + 1
 
-                # Calculate fitness
-                fitness = (
-                    score * 1.0 +           # Base score
-                    total_lines_cleared * 100 +    # Lines cleared
-                    moves_made * 0.5 -      # Survival bonus
-                    current_holes * 20 -    # Holes penalty
-                    current_height * 10     # Height penalty
-                )
+                # Calculate current metrics
+                heights = [0] * game_state['grid'].shape[1]
+                holes = 0
+                for x in range(game_state['grid'].shape[1]):
+                    found_block = False
+                    for y in range(game_state['grid'].shape[0]):
+                        if game_state['grid'][y][x] != 0:
+                            if not found_block:
+                                heights[x] = game_state['grid'].shape[0] - y
+                                found_block = True
+                        elif found_block:
+                            holes += 1
 
-                # Update metrics visualizer
-                metrics_visualizer.update(
-                    score=score,
-                    fitness=fitness,
-                    lines=total_lines_cleared,
-                    height=current_height
-                )
+                game_state['max_height'] = max(heights)
+                game_state['holes'] = holes
+                game_state['bumpiness'] = sum(abs(heights[i] - heights[i+1]) 
+                                            for i in range(len(heights)-1))
 
-                # Spawn new piece
-                tetromino_key = next_tetromino_key
-                tetromino = next_tetromino
-                next_tetromino_key, next_tetromino, _ = spawn_tetromino()
-                position = (grid.shape[1] // 2 - 2, 0)
-                
-                if not is_valid_position(grid, tetromino, position):
-                    print("Game over: Can't place new piece")
-                    game_over = True
+                # Prepare next piece
+                current_piece['key'] = next_piece['key']
+                current_piece['tetromino'] = next_piece['tetromino']
+                current_piece['position'] = (game_state['grid'].shape[1] // 2 - 2, 0)
+                next_piece['key'], next_piece['tetromino'], next_piece['rotation'] = spawn_tetromino()
+
+                if not is_valid_position(game_state['grid'], current_piece['tetromino'], 
+                                      current_piece['position']):
+                    print(f"Game Over - Can't place new piece")
+                    game_active = False
                     continue
 
-                last_move_time = current_time
+                game_state['last_move_time'] = current_time
 
-            # Draw everything
+                # Update visualizer
+                metrics_visualizer.update(
+                    score=game_state['score'],
+                    fitness=0,  # Will be calculated at game end
+                    lines=game_state['lines_cleared'],
+                    height=game_state['max_height'],
+                    holes=game_state['holes']
+                )
+
+            # Draw game state
             screen.fill(BLACK)
-            draw_grid(screen, grid)
-            draw_score(screen, score)
-            draw_next_tetromino(screen, next_tetromino)
+            draw_grid(screen, game_state['grid'])
+            draw_next_tetromino(screen, next_piece['tetromino'])
+            draw_score(screen, game_state['score'])
             
             # Draw metrics panel
-            current_stats = {
-                'score': score,
-                'lines': total_lines_cleared,
-                'holes': current_holes if 'current_holes' in locals() else 0,
-                'height': current_height if 'current_height' in locals() else 0,
-                'fitness': fitness
-            }
-            
             draw_metrics_panel(
                 screen=screen,
                 metrics_visualizer=metrics_visualizer,
-                generation=generation,
+                generation=ai.generation,
                 member=ai.current_member + 1,
                 population_size=ai.population_size,
-                current_stats=current_stats
+                current_stats={
+                    'score': game_state['score'],
+                    'lines': game_state['lines_cleared'],
+                    'holes': game_state['holes'],
+                    'height': game_state['max_height'],
+                    'fitness': 0
+                }
             )
-            
-            if game_over:
+
+            if not game_active:
                 draw_game_over(screen)
-            
+
             pygame.display.flip()
             clock.tick(FPS)
 
-        # Game over for current member
-        if running:
-            # Calculate final fitness for this member
+        # Game over - Process results
+        if not game_active:
+            # Update AI
             fitness = ai.add_fitness_score(
-                score=score,
-                moves=moves_made,
-                lines_cleared=total_lines_cleared,
-                max_height=current_height if 'current_height' in locals() else 22
+                score=game_state['score'],
+                moves=game_state['moves'],
+                lines_cleared=game_state['lines_cleared'],
+                max_height=game_state['max_height'],
+                holes=game_state['holes'],
+                bumpiness=game_state['bumpiness']
             )
-            
-            print(f"Member {ai.current_member}/{ai.population_size} finished:")
-            print(f"Score: {score}, Moves: {moves_made}, Lines: {total_lines_cleared}")
-            print(f"Fitness: {fitness}")
-            
-            # Generate plots for this generation if it's complete
-            if ai.current_member == 0:  # Just evolved
-                generation = ai.generation
-                stats.generate_plots()
-                
-                print(f"\nGeneration {generation} Statistics:")
-                print(f"Best Fitness: {max(ai.generation_stats['best_fitness'])}")
-                print(f"Average Fitness: {ai.generation_stats['avg_fitness'][-1]}")
-                
-            pygame.time.wait(100)  # Short delay between members
+
+            # Update statistics
+            metrics = TrainingMetrics(
+                episode=game_state['moves'],
+                score=game_state['score'],
+                lines_cleared=game_state['lines_cleared'],
+                avg_height=game_state['max_height'],
+                holes=game_state['holes'],
+                reward=fitness
+            )
+            stats.update(metrics)
+
+            # Periodic saves and reports
+            current_time = time.time()
+            if current_time - last_save_time > 300:  # Save every 5 minutes
+                stats.generate_enhanced_plots()
+                stats.save_statistics()
+                ai.save_state('tetris_genetic_state.pth')
+                last_save_time = current_time
+
+            pygame.time.wait(500)  # Brief pause between games
 
     # Final cleanup
-    print("\nTraining Summary:")
-    print(f"Total Generations: {generation}")
-    print(f"Best Ever Fitness: {ai.best_fitness}")
+    stats.generate_enhanced_plots()
+    stats.save_statistics()
+    stats.print_training_summary()
     ai.save_state('tetris_genetic_state.pth')
     pygame.quit()
 
