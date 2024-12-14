@@ -12,36 +12,42 @@ from tetromino import TETROMINOES
 @dataclass
 class NetworkConfig:
     input_size: int = 54
-    hidden_layers: List[int] = (256, 128, 128, 80)
+    hidden_layers: List[int] = (512, 256, 128)  # Deeper network
     use_batch_norm: bool = True
-    dropout_rate: float = 0.2
-    activation: str = 'relu'
-
-@dataclass
-class GeneticConfig:
-    population_size: int = 30
-    mutation_rate: float = 0.1
-    mutation_strength: float = 0.2
-    elite_size: int = 2
-    tournament_size: int = 3
-    crossover_rate: float = 0.7
-    save_interval: int = 1  # Save every N generations
+    dropout_rate: float = 0.1          # Reduced dropout
+    activation: str = 'leaky_relu'     # Changed activation function
 
 @dataclass
 class LearningConfig:
-    # Fitness calculation weights
-    score_weight: float = 1.0
-    lines_weight: float = 100.0
-    moves_weight: float = 0.5
-    height_penalty: float = 10.0
-    holes_penalty: float = 20.0
-    bumpiness_penalty: float = 5.0
+    # Simplified reward structure focusing on immediate board state
+    score_weight: float = 10.0         
+    lines_weight: float = 100.0        
+    moves_weight: float = 0.0          # Removed survival reward
+    
+    # Board state penalties
+    height_penalty: float = 2.0        # Per-column height penalty
+    holes_penalty: float = 5.0         # Per-hole penalty
+    bumpiness_penalty: float = 1.0     # Reduced bumpiness impact
+    
+    # Added new rewards
+    tetris_bonus: float = 800.0        # Big bonus for 4-line clear
+    well_bonus: float = 2.0            # Reward for maintaining a well
+    surface_bonus: float = 1.0         # Reward for flat surface
     
     # Move selection weights
-    network_weight: float = 0.6
-    connection_weight: float = 0.2
-    gap_fill_weight: float = 0.2
+    network_weight: float = 1.0        # Only use network evaluation
+    connection_weight: float = 0.0     # Removed heuristic influence
+    gap_fill_weight: float = 0.0       # Removed heuristic influence
 
+@dataclass
+class GeneticConfig:
+    population_size: int = 100         # Much larger population
+    mutation_rate: float = 0.01        # Very rare mutations
+    mutation_strength: float = 0.01    # Very small mutations
+    elite_size: int = 15               # Keep more top performers
+    tournament_size: int = 10          # Larger tournaments
+    crossover_rate: float = 0.95       # Almost always crossover
+    
 class TetrisNet(nn.Module):
     def __init__(self, config: NetworkConfig):
         super(TetrisNet, self).__init__()
@@ -75,9 +81,21 @@ class TetrisNet(nn.Module):
         self._init_weights()
 
     def _init_weights(self):
-        for layer in self.layers:
-            nn.init.xavier_uniform_(layer.weight)
+        """Initialize network weights with verified randomization"""
+        print("\nInitializing network weights:")
+        for i, layer in enumerate(self.layers):
+            # Use normal distribution instead of Xavier
+            nn.init.normal_(layer.weight, mean=0.0, std=0.1)
             nn.init.zeros_(layer.bias)
+            
+            # Verify randomization
+            weight_stats = {
+                'mean': layer.weight.mean().item(),
+                'std': layer.weight.std().item(),
+                'min': layer.weight.min().item(),
+                'max': layer.weight.max().item()
+            }
+            print(f"Layer {i} weight stats: {weight_stats}")
 
     def forward(self, x):
         for i, (layer, batch_norm) in enumerate(zip(self.layers, self.batch_norms)):
@@ -94,7 +112,6 @@ class TetrisNet(nn.Module):
         cloned = TetrisNet(self.config)
         cloned.load_state_dict(self.state_dict())
         return cloned
-
 class GeneticTetrisAI:
     def __init__(self, network_config: Optional[NetworkConfig] = None,
                  genetic_config: Optional[GeneticConfig] = None,
@@ -124,6 +141,7 @@ class GeneticTetrisAI:
         self.best_fitness = float('-inf')
         self.best_network: Optional[TetrisNet] = None
         self.last_save_generation = 0
+        self.current_grid = None  # Track current grid state
         
         # Initialize population
         self.population = [TetrisNet(self.network_config).to(self.device) 
@@ -166,6 +184,70 @@ class GeneticTetrisAI:
             with open(filepath, 'w') as f:
                 yaml.dump(config.__dict__, f, default_flow_style=False)
 
+    def evaluate_board_state(self, grid, lines_cleared, move_made):
+        """Evaluate board state after a move"""
+        # Calculate column heights
+        heights = self._get_heights(grid)
+        max_height = max(heights)
+        avg_height = sum(heights) / len(heights)
+        
+        # Count holes with weighted depth penalty
+        holes = 0
+        deep_hole_penalty = 0
+        for x in range(grid.shape[1]):
+            found_block = False
+            hole_depth = 0
+            for y in range(grid.shape[0]):
+                if grid[y][x] != 0:
+                    found_block = True
+                elif found_block:
+                    holes += 1
+                    hole_depth += 1
+                    deep_hole_penalty += hole_depth * 0.5  # Deeper holes are worse
+        
+        # Check for well formation (good for Tetris)
+        well_count = 0
+        for x in range(1, grid.shape[1]-1):
+            if heights[x] < heights[x-1] - 2 and heights[x] < heights[x+1] - 2:
+                well_count += 1
+        
+        # Calculate surface smoothness (ignoring wells)
+        bumpiness = 0
+        surface_breaks = 0
+        for i in range(len(heights)-1):
+            diff = abs(heights[i] - heights[i+1])
+            bumpiness += diff
+            if diff > 1:
+                surface_breaks += 1
+        
+        # Calculate immediate rewards
+        line_reward = lines_cleared * self.learning_config.lines_weight
+        if lines_cleared == 4:
+            line_reward *= 2  # Double reward for Tetris
+        
+        # Calculate penalties
+        height_penalty = max_height * self.learning_config.height_penalty
+        holes_penalty = (holes + deep_hole_penalty) * self.learning_config.holes_penalty
+        surface_penalty = (bumpiness + surface_breaks) * self.learning_config.bumpiness_penalty
+        
+        # Calculate bonuses
+        well_bonus = well_count * self.learning_config.well_bonus
+        surface_bonus = (10 - surface_breaks) * self.learning_config.surface_bonus
+        
+        # Combined reward with debug output
+        reward = (line_reward + well_bonus + surface_bonus - 
+                height_penalty - holes_penalty - surface_penalty)
+        
+        if move_made:  # Only print debug when actually making a move
+            print(f"\nBoard State Evaluation:")
+            print(f"Heights - Max: {max_height}, Avg: {avg_height:.1f}")
+            print(f"Holes: {holes} (Depth Penalty: {deep_hole_penalty:.1f})")
+            print(f"Surface - Bumpiness: {bumpiness}, Breaks: {surface_breaks}")
+            print(f"Well formation: {well_count}")
+            print(f"Final reward: {reward:.2f}")
+        
+        return reward
+
     def get_state(self, grid, tetromino, position) -> torch.Tensor:
         """Extract state features for the neural network"""
         heights = self._get_heights(grid)
@@ -196,7 +278,6 @@ class GeneticTetrisAI:
         ])
         
         return torch.FloatTensor(state_features).unsqueeze(0).to(self.device)
-
     def _get_heights(self, grid) -> np.ndarray:
         """Calculate height of each column"""
         heights = []
@@ -238,101 +319,88 @@ class GeneticTetrisAI:
                         for i in range(len(heights)-1)])
 
     def choose_action(self, state: torch.Tensor, possible_moves: List[Tuple], 
-                     grid: np.ndarray, tetromino_key: str, tetromino: np.ndarray) -> Optional[Tuple]:
-        """Choose the best action using current network and heuristics"""
+                    grid: np.ndarray, tetromino_key: str, tetromino: np.ndarray) -> Optional[Tuple]:
+        """Choose the best action with balanced network and heuristic influence"""
         if not possible_moves:
             return None
             
         current_network = self.population[self.current_member]
+        print(f"\nEvaluating {len(possible_moves)} possible moves...")
+        
         with torch.no_grad():
-            q_values = current_network(state)
+            network_outputs = current_network(state)
             
             # Evaluate each possible move
             move_scores = []
             for i, (rotation_index, position) in enumerate(possible_moves):
                 current_tetromino = TETROMINOES[tetromino_key][rotation_index]
                 
-                # Get network score
-                q_value = q_values[0][i].item() if i < q_values.size(1) else 0
+                # Get raw network score (bounded by size of output)
+                network_score = network_outputs[0][i].item() if i < network_outputs.size(1) else 0
                 
-                # Calculate heuristic scores
-                connections = self._count_connections(grid, position, current_tetromino)
-                gaps_filled = self._count_gaps_filled(grid, position, current_tetromino)
+                # Simulate move
+                temp_grid = grid.copy()
+                valid_placement = True
+                for ti, row in enumerate(current_tetromino):
+                    for tj, cell in enumerate(row):
+                        if cell:
+                            new_y, new_x = position[1] + ti, position[0] + tj
+                            if 0 <= new_y < grid.shape[0] and 0 <= new_x < grid.shape[1]:
+                                temp_grid[new_y][new_x] = cell
+                            else:
+                                valid_placement = False
+                                break
                 
-                # Combine scores using configured weights
-                total_score = (
-                    q_value * self.learning_config.network_weight +
-                    connections * self.learning_config.connection_weight +
-                    gaps_filled * self.learning_config.gap_fill_weight
-                )
+                if not valid_placement:
+                    continue
+                
+                # Get heuristic score
+                heuristic_score = self.evaluate_board_state(temp_grid, 0, True)
+                
+                # Early in training, use more randomization
+                if self.generation < 5:
+                    network_weight = 0.2  # Reduce network influence initially
+                    random_weight = 0.3   # Add randomization
+                    heuristic_weight = 0.5
+                    total_score = (
+                        network_score * network_weight +
+                        heuristic_score * heuristic_weight +
+                        random.random() * random_weight
+                    )
+                else:
+                    # Gradually increase network influence
+                    network_weight = min(0.8, 0.2 + (self.generation / 20))
+                    heuristic_weight = 1.0 - network_weight
+                    total_score = (
+                        network_score * network_weight +
+                        heuristic_score * heuristic_weight
+                    )
                 
                 move_scores.append((total_score, rotation_index, position))
+                
+                if i < 3:  # Print first few moves for debugging
+                    print(f"Move {i}: rot={rotation_index}, pos={position}")
+                    print(f"  Network score: {network_score:.2f}")
+                    print(f"  Heuristic score: {heuristic_score:.2f}")
+                    print(f"  Total score: {total_score:.2f}")
             
+            if not move_scores:
+                return None
+                
             # Choose best move
             best_score, rotation_index, position = max(move_scores)
-            print(f"Move chosen: rot={rotation_index}, pos={position}, score={best_score:.2f}")
-            
+            print(f"\nChosen move: rot={rotation_index}, pos={position}, score={best_score:.2f}")
             return (rotation_index, position)
-    
-    def _count_connections(self, grid: np.ndarray, position: Tuple[int, int], 
-                        tetromino: np.ndarray) -> int:
-        """Count how many sides of the tetromino connect with existing pieces"""
-        connections = 0
-        x, y = position
         
-        for i in range(len(tetromino)):
-            for j in range(len(tetromino[i])):
-                if tetromino[i][j] != 0:
-                    for dx, dy in [(0,1), (0,-1), (1,0), (-1,0)]:
-                        new_x, new_y = x + j + dx, y + i + dy
-                        if (0 <= new_x < grid.shape[1] and 
-                            0 <= new_y < grid.shape[0] and 
-                            grid[new_y][new_x] != 0):
-                            connections += 1
-        return connections
-
-    def _count_gaps_filled(self, grid: np.ndarray, position: Tuple[int, int], 
-                        tetromino: np.ndarray) -> int:
-        """Count how many gaps the tetromino fills"""
-        gaps_filled = 0
-        x, y = position
-        
-        for i in range(len(tetromino)):
-            for j in range(len(tetromino[i])):
-                if tetromino[i][j] != 0:
-                    if self._is_filling_gap(grid, x + j, y + i):
-                        gaps_filled += 1
-        return gaps_filled
-
-    def _is_filling_gap(self, grid: np.ndarray, x: int, y: int) -> bool:
-        """Check if a position represents a gap that should be filled"""
-        if y >= grid.shape[0] - 1:
-            return False
-            
-        adjacent_blocks = 0
-        for dx, dy in [(0,1), (0,-1), (1,0), (-1,0)]:
-            new_x, new_y = x + dx, y + dy
-            if (0 <= new_x < grid.shape[1] and 
-                0 <= new_y < grid.shape[0] and 
-                grid[new_y][new_x] != 0):
-                adjacent_blocks += 1
-        
-        return adjacent_blocks >= 2
-
     def add_fitness_score(self, score: int, moves: int, lines_cleared: int, 
-                        max_height: float, holes: int, bumpiness: float) -> float:
+                         max_height: float, holes: int, bumpiness: float) -> float:
         """Calculate and add fitness score when a game is complete"""
-        # Calculate fitness
-        fitness = (
-            score * self.learning_config.score_weight +
-            lines_cleared * self.learning_config.lines_weight +
-            moves * self.learning_config.moves_weight -
-            max_height * self.learning_config.height_penalty -
-            holes * self.learning_config.holes_penalty -
-            bumpiness * self.learning_config.bumpiness_penalty
-        )
+        # Get the current grid state evaluation
+        fitness = self.evaluate_board_state(self.current_grid, lines_cleared, True)
         
-        # Debug output
+        # Add score component
+        fitness += score * self.learning_config.score_weight
+        
         print(f"\n=== Generation {self.generation}, Member {self.current_member + 1}/{self.population_size} ===")
         print(f"Score: {score}, Lines: {lines_cleared}, Moves: {moves}")
         print(f"Fitness: {fitness:.2f}")
@@ -355,38 +423,20 @@ class GeneticTetrisAI:
 
     def _evolve_to_next_generation(self):
         """Handle generation transition"""
-        # Calculate and store diversity
         diversity = self._calculate_population_diversity()
         self.generation_stats['population_diversity'].append(diversity)
         
-        # Store evolution point
         self.state_history['evolution_points'].append({
             'generation': self.generation,
             'best_fitness': max(self.fitness_scores),
             'avg_fitness': sum(self.fitness_scores) / len(self.fitness_scores)
         })
         
-        # Evolve population
         self.evolve_population()
         
         # Reset counters
         self.current_member = 0
         self.fitness_scores = []
-
-    def _calculate_population_diversity(self) -> float:
-        """Calculate diversity metric for current population"""
-        param_vectors = []
-        for network in self.population:
-            params = torch.cat([p.flatten() for p in network.parameters()])
-            param_vectors.append(params)
-        
-        distances = []
-        for i in range(len(param_vectors)):
-            for j in range(i + 1, len(param_vectors)):
-                distance = torch.norm(param_vectors[i] - param_vectors[j])
-                distances.append(distance.item())
-        
-        return np.mean(distances) if distances else 0.0
 
     def evolve_population(self):
         """Create next generation using genetic algorithm"""
@@ -402,6 +452,7 @@ class GeneticTetrisAI:
         if best_fitness > self.best_fitness:
             self.best_fitness = best_fitness
             self.best_network = self.population[best_idx].clone()
+            self.generation_stats['generation_best_network'] = self.population[best_idx].clone()
         
         # Sort population by fitness
         population_fitness = list(zip(self.population, self.fitness_scores))
@@ -420,17 +471,16 @@ class GeneticTetrisAI:
                 parent1 = self._tournament_select(population_fitness)
                 parent2 = self._tournament_select(population_fitness)
                 child = self._crossover(parent1, parent2)
+                child = self._mutate(child)
+                new_population.append(child)
             else:
                 parent = self._tournament_select(population_fitness)
                 child = parent.clone()
-            
-            child = self._mutate(child)
-            new_population.append(child)
+                child = self._mutate(child)
+                new_population.append(child)
         
-        # Update population
+        # Update population and stats
         self.population = new_population
-        
-        # Store statistics
         self.generation_stats['best_fitness'].append(best_fitness)
         self.generation_stats['avg_fitness'].append(avg_fitness)
         self.generation_stats['worst_fitness'].append(worst_fitness)
@@ -439,6 +489,30 @@ class GeneticTetrisAI:
         print(f"Best Fitness: {best_fitness:.2f}")
         print(f"Average Fitness: {avg_fitness:.2f}")
         print(f"Population Size: {len(self.population)}")
+
+    def _tournament_select(self, population_fitness: List[Tuple[TetrisNet, float]]) -> TetrisNet:
+        """Select parent using tournament selection"""
+        tournament = random.sample(population_fitness, self.genetic_config.tournament_size)
+        return max(tournament, key=lambda x: x[1])[0]
+
+    def _crossover(self, parent1: TetrisNet, parent2: TetrisNet) -> TetrisNet:
+        """Create child network through crossover"""
+        child = TetrisNet(self.network_config).to(self.device)
+        for (name1, param1), (name2, param2) in zip(parent1.named_parameters(), 
+                                                   parent2.named_parameters()):
+            if random.random() < 0.5:
+                child.state_dict()[name1].copy_(param1)
+            else:
+                child.state_dict()[name1].copy_(param2)
+        return child
+
+    def _mutate(self, network: TetrisNet) -> TetrisNet:
+        """Apply random mutations to network parameters"""
+        for param in network.parameters():
+            if random.random() < self.genetic_config.mutation_rate:
+                mutation = torch.randn_like(param) * self.genetic_config.mutation_strength
+                param.data += mutation
+        return network
 
     def save_state(self, path='tetris_genetic_state.pth'):
         """Save current state"""
@@ -463,7 +537,7 @@ class GeneticTetrisAI:
         print(f"State saved to: {save_path}")
 
     def load_state(self, path='tetris_genetic_state.pth'):
-        """Load saved state with backward compatibility"""
+        """Load saved state"""
         load_path = os.path.join('models', path)
         print(f"Loading state from: {load_path}")
         
@@ -475,30 +549,17 @@ class GeneticTetrisAI:
             self.genetic_config = GeneticConfig(**checkpoint['genetic_config'])
             self.learning_config = LearningConfig(**checkpoint['learning_config'])
             
-            # Load core state with defaults for backward compatibility
+            # Load core state
             self.generation = checkpoint.get('generation', 0)
             self.current_member = checkpoint.get('current_member', 0)
             self.fitness_scores = checkpoint.get('fitness_scores', [])
             self.best_fitness = checkpoint.get('best_fitness', float('-inf'))
-            
-            # Initialize state history if not present in checkpoint
             self.state_history = checkpoint.get('state_history', {
                 'generations': [],
                 'member_progress': [],
                 'fitness_history': [],
                 'evolution_points': []
             })
-            
-            # Load generation stats with defaults
-            default_stats = {
-                'best_fitness': [],
-                'avg_fitness': [],
-                'worst_fitness': [],
-                'population_diversity': [],
-                'mutation_effects': [],
-                'generation_best_network': None
-            }
-            self.generation_stats = checkpoint.get('generation_stats', default_stats)
             
             # Load population
             self.population = []
@@ -514,35 +575,6 @@ class GeneticTetrisAI:
             
             print(f"State loaded successfully - Generation: {self.generation}, Member: {self.current_member}")
             
-        except FileNotFoundError:
-            print(f"No saved state found at {load_path}")
-            raise
         except Exception as e:
             print(f"Error loading state: {e}")
-            print("Starting fresh...")
-            self._init_state_tracking()  # Initialize fresh state tracking
-
-
-    def _tournament_select(self, population_fitness: List[Tuple[TetrisNet, float]]) -> TetrisNet:
-        """Select parent using tournament selection"""
-        tournament = random.sample(population_fitness, self.genetic_config.tournament_size)
-        return max(tournament, key=lambda x: x[1])[0]
-
-    def _crossover(self, parent1: TetrisNet, parent2: TetrisNet) -> TetrisNet:
-        """Create child network through crossover"""
-        child = TetrisNet(self.network_config).to(self.device)
-        for (name1, param1), (name2, param2) in zip(parent1.named_parameters(), 
-                                                parent2.named_parameters()):
-            if random.random() < 0.5:
-                child.state_dict()[name1].copy_(param1)
-            else:
-                child.state_dict()[name1].copy_(param2)
-        return child
-
-    def _mutate(self, network: TetrisNet) -> TetrisNet:
-        """Apply random mutations to network parameters"""
-        for param in network.parameters():
-            if random.random() < self.genetic_config.mutation_rate:
-                mutation = torch.randn_like(param) * self.genetic_config.mutation_strength
-                param.data += mutation
-        return network
+            self._init_state_tracking()

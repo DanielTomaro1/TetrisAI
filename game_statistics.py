@@ -20,6 +20,11 @@ class TrainingMetrics:
     epsilon: float = 0.0
     loss: float = 0.0
     q_value: float = 0.0
+    generation: int = 0
+    member: int = 0
+    well_count: int = 0
+    surface_smoothness: float = 0.0
+    deep_holes: float = 0.0
 
 class GameStatistics:
     def __init__(self, window_size: int = 100):
@@ -29,11 +34,14 @@ class GameStatistics:
         os.makedirs('outputs/plots/animated', exist_ok=True)
         os.makedirs('outputs/reports', exist_ok=True)
         
-        # Performance metrics
+        # Enhanced performance metrics
         self.scores: List[float] = []
         self.lines_cleared: List[int] = []
         self.avg_heights: List[float] = []
         self.holes: List[int] = []
+        self.deep_holes: List[float] = []
+        self.well_formations: List[int] = []
+        self.surface_smoothness: List[float] = []
         
         # Learning metrics
         self.rewards: List[float] = []
@@ -41,10 +49,18 @@ class GameStatistics:
         self.losses: List[float] = []
         self.q_values: List[float] = []
         
-        # Genetic algorithm metrics
+        # Enhanced genetic metrics
+        self.generation_stats: List[Dict] = []
+        self.member_stats: List[Dict] = []
         self.population_diversity: List[float] = []
         self.mutation_effects: List[Dict] = []
         self.generation_metrics: List[Dict] = []
+        
+        # Generation tracking
+        self.current_generation: int = 0
+        self.generation_scores: Dict[int, List[float]] = {}
+        self.generation_lines: Dict[int, List[int]] = {}
+        self.generation_fitness: Dict[int, List[float]] = {}
         
         # Episode information
         self.moves: int = 0
@@ -76,6 +92,42 @@ class GameStatistics:
         self.lines_cleared.append(metrics.lines_cleared)
         self.avg_heights.append(metrics.avg_height)
         self.holes.append(metrics.holes)
+        self.deep_holes.append(metrics.deep_holes)
+        self.well_formations.append(metrics.well_count)
+        self.surface_smoothness.append(metrics.surface_smoothness)
+        
+        # Update generation tracking
+        if metrics.generation != self.current_generation:
+            if self.current_generation in self.generation_scores:
+                # Save generation statistics
+                self.generation_stats.append({
+                    'generation': self.current_generation,
+                    'avg_score': np.mean(self.generation_scores[self.current_generation]),
+                    'max_score': max(self.generation_scores[self.current_generation]),
+                    'min_score': min(self.generation_scores[self.current_generation]),
+                    'avg_lines': np.mean(self.generation_lines[self.current_generation]),
+                    'avg_fitness': np.mean(self.generation_fitness[self.current_generation])
+                })
+            self.current_generation = metrics.generation
+            
+        # Update generation dictionaries
+        if metrics.generation not in self.generation_scores:
+            self.generation_scores[metrics.generation] = []
+            self.generation_lines[metrics.generation] = []
+            self.generation_fitness[metrics.generation] = []
+            
+        self.generation_scores[metrics.generation].append(metrics.score)
+        self.generation_lines[metrics.generation].append(metrics.lines_cleared)
+        self.generation_fitness[metrics.generation].append(metrics.reward)
+        
+        # Update member stats
+        self.member_stats.append({
+            'generation': metrics.generation,
+            'member': metrics.member,
+            'score': metrics.score,
+            'lines': metrics.lines_cleared,
+            'fitness': metrics.reward
+        })
         
         # Update learning metrics
         self.rewards.append(metrics.reward)
@@ -105,7 +157,6 @@ class GameStatistics:
         ret = np.cumsum(data_array, dtype=float)
         ret[window:] = ret[window:] - ret[:-window]
         return ret[window - 1:] / window
-
     def generate_enhanced_plots(self):
         """Generate comprehensive visualization of all metrics"""
         plot_dir = os.path.join(self.session_dir, 'plots')
@@ -154,28 +205,34 @@ class GameStatistics:
                 'Score': self.scores,
                 'Lines': self.lines_cleared,
                 'Height': self.avg_heights,
-                'Holes': self.holes
+                'Holes': self.holes,
+                'Deep Holes': self.deep_holes,
+                'Wells': self.well_formations,
+                'Smoothness': self.surface_smoothness
             })
             sns.heatmap(metrics_df.corr(), annot=True, cmap='coolwarm')
             plt.title('Metrics Correlation')
         
-        # Performance distribution
+        # Generation performance
         plt.subplot(2, 2, 3)
-        if len(self.scores) > 0:
-            data = [self.scores, self.lines_cleared]
-            plt.violinplot(data)
-            plt.xticks([1, 2], ['Scores', 'Lines Cleared'])
-            plt.title('Performance Distribution')
+        if self.generation_stats:
+            gen_df = pd.DataFrame(self.generation_stats)
+            plt.plot(gen_df['generation'], gen_df['avg_score'], label='Avg Score')
+            plt.plot(gen_df['generation'], gen_df['max_score'], label='Max Score')
+            plt.fill_between(gen_df['generation'], 
+                           gen_df['min_score'], gen_df['max_score'], 
+                           alpha=0.2)
+            plt.title('Generation Performance')
+            plt.xlabel('Generation')
+            plt.ylabel('Score')
+            plt.legend()
         
         # Learning progress
         plt.subplot(2, 2, 4)
-        if self.losses:
-            plt.plot(self.get_rolling_average(self.losses), label='Loss')
         if self.rewards:
             plt.plot(self.get_rolling_average(self.rewards), label='Reward')
-        if self.losses or self.rewards:
-            plt.title('Learning Progress')
-            plt.legend()
+        plt.title('Learning Progress')
+        plt.legend()
         
         plt.tight_layout()
         plt.savefig(os.path.join(output_dir, 'overview_dashboard.png'))
@@ -185,25 +242,25 @@ class GameStatistics:
         """Create detailed performance analysis plots"""
         plt.figure(figsize=(15, 10))
         
-        # Performance trends
+        # Performance metrics over generations
         plt.subplot(2, 1, 1)
-        if self.best_scores_per_generation:
-            generations = range(len(self.best_scores_per_generation))
-            plt.plot(generations, self.best_scores_per_generation, label='Best')
-            plt.plot(generations, self.avg_scores_per_generation, label='Average')
-            plt.plot(generations, self.worst_scores_per_generation, label='Worst')
-            plt.title('Score Distribution per Generation')
+        if self.generation_stats:
+            gen_df = pd.DataFrame(self.generation_stats)
+            plt.plot(gen_df['generation'], gen_df['avg_fitness'], label='Avg Fitness')
+            plt.plot(gen_df['generation'], gen_df['avg_lines'], label='Avg Lines')
+            plt.title('Performance Metrics per Generation')
             plt.xlabel('Generation')
-            plt.ylabel('Score')
+            plt.ylabel('Value')
             plt.legend()
         
-        # Performance metrics boxplot
+        # Member performance distribution
         plt.subplot(2, 1, 2)
-        if len(self.scores) > 0:
-            data = [self.scores, self.lines_cleared, self.holes]
-            plt.boxplot(data)
-            plt.xticks([1, 2, 3], ['Scores', 'Lines', 'Holes'])
-            plt.title('Performance Metrics Distribution')
+        if self.member_stats:
+            member_df = pd.DataFrame(self.member_stats)
+            sns.boxplot(x='generation', y='fitness', data=member_df)
+            plt.title('Member Fitness Distribution per Generation')
+            plt.xlabel('Generation')
+            plt.ylabel('Fitness')
         
         plt.tight_layout()
         plt.savefig(os.path.join(output_dir, 'performance_analysis.png'))
@@ -213,25 +270,27 @@ class GameStatistics:
         """Create plots showing learning dynamics"""
         plt.figure(figsize=(15, 10))
         
-        # Learning indicators
+        # Genetic algorithm metrics
         plt.subplot(2, 1, 1)
-        if self.losses:
-            plt.plot(self.get_rolling_average(self.losses), label='Loss')
-        if self.rewards:
-            plt.plot(self.get_rolling_average(self.rewards), label='Reward')
-        if self.q_values:
-            plt.plot(self.get_rolling_average(self.q_values), label='Q-Value')
-        plt.title('Learning Dynamics')
-        plt.legend()
-        
-        # Mutation effects
-        plt.subplot(2, 1, 2)
-        if self.mutation_effects:
-            effects_df = pd.DataFrame(self.mutation_effects)
-            plt.scatter(effects_df['generation'], effects_df['improvement'])
-            plt.title('Mutation Effects on Fitness')
+        if self.generation_stats:
+            gen_df = pd.DataFrame(self.generation_stats)
+            plt.plot(gen_df['generation'], 
+                    (gen_df['max_score'] - gen_df['min_score']) / gen_df['avg_score'],
+                    label='Score Spread')
+            plt.title('Population Score Distribution')
             plt.xlabel('Generation')
-            plt.ylabel('Fitness Improvement')
+            plt.ylabel('Score Spread')
+        
+        # Board state metrics
+        plt.subplot(2, 1, 2)
+        if len(self.holes) > 0:
+            plt.plot(self.get_rolling_average(self.holes), label='Holes')
+            plt.plot(self.get_rolling_average(self.deep_holes), label='Deep Holes')
+            plt.plot(self.get_rolling_average(self.surface_smoothness), label='Surface Smoothness')
+            plt.title('Board State Metrics')
+            plt.xlabel('Episodes')
+            plt.ylabel('Value')
+            plt.legend()
         
         plt.tight_layout()
         plt.savefig(os.path.join(output_dir, 'learning_dynamics.png'))
@@ -239,14 +298,29 @@ class GameStatistics:
 
     def _create_diversity_analysis(self, output_dir: str):
         """Create population diversity analysis plots"""
+        plt.figure(figsize=(15, 10))
+        
+        # Population diversity
+        plt.subplot(2, 1, 1)
         if self.population_diversity:
-            plt.figure(figsize=(10, 6))
             plt.plot(self.population_diversity)
             plt.title('Population Diversity Over Time')
             plt.xlabel('Generation')
             plt.ylabel('Diversity Metric')
-            plt.savefig(os.path.join(output_dir, 'diversity_analysis.png'))
-            plt.close()
+        
+        # Well formations and surface metrics
+        plt.subplot(2, 1, 2)
+        if len(self.well_formations) > 0:
+            plt.plot(self.get_rolling_average(self.well_formations), label='Wells')
+            plt.plot(self.get_rolling_average(self.surface_smoothness), label='Smoothness')
+            plt.title('Strategic Metrics')
+            plt.xlabel('Episodes')
+            plt.ylabel('Value')
+            plt.legend()
+        
+        plt.tight_layout()
+        plt.savefig(os.path.join(output_dir, 'diversity_analysis.png'))
+        plt.close()
 
     def _generate_html_report(self):
         """Generate comprehensive HTML report"""
@@ -279,12 +353,13 @@ class GameStatistics:
                             <p>Total Episodes: {len(self.scores)}</p>
                             <p>Best Score: {max(self.scores) if self.scores else 0}</p>
                             <p>Average Score: {np.mean(self.scores) if self.scores else 0:.2f}</p>
+                            <p>Generations: {len(self.generation_stats)}</p>
                         </div>
                         <div class="stat-box">
                             <h3>Learning Metrics</h3>
                             <p>Total Training Steps: {self.moves}</p>
                             <p>Average Reward: {np.mean(self.rewards) if self.rewards else 0:.2f}</p>
-                            <p>Final Loss: {self.losses[-1] if self.losses else 0:.4f}</p>
+                            <p>Latest Generation Avg: {self.generation_stats[-1]['avg_score'] if self.generation_stats else 0:.2f}</p>
                         </div>
                     </div>
                     <img src="plots/overview_dashboard.png" alt="Overview Dashboard">
@@ -301,7 +376,7 @@ class GameStatistics:
                 </div>
                 
                 <div class="section">
-                    <h2>Population Diversity</h2>
+                    <h2>Diversity Analysis</h2>
                     <img src="plots/diversity_analysis.png" alt="Diversity Analysis">
                 </div>
             </div>
@@ -332,18 +407,22 @@ class GameStatistics:
                 'average_reward': np.mean(self.rewards) if self.rewards else 0,
                 'average_q_value': np.mean(self.q_values) if self.q_values else 0,
                 'average_loss': np.mean(self.losses) if self.losses else 0,
-                'total_training_steps': len(self.losses)
+                'total_training_steps': self.moves
             },
             'performance_metrics': {
                 'average_height': np.mean(self.avg_heights) if self.avg_heights else 0,
                 'average_holes': np.mean(self.holes) if self.holes else 0,
+                'average_deep_holes': np.mean(self.deep_holes) if self.deep_holes else 0,
+                'average_wells': np.mean(self.well_formations) if self.well_formations else 0,
+                'average_smoothness': np.mean(self.surface_smoothness) if self.surface_smoothness else 0,
                 'max_score': max(self.scores) if self.scores else 0,
                 'max_lines_cleared_at_once': max(self.lines_cleared) if self.lines_cleared else 0
             },
             'genetic_metrics': {
+                'total_generations': len(self.generation_stats),
+                'final_generation_stats': self.generation_stats[-1] if self.generation_stats else {},
                 'population_diversity': self.population_diversity[-1] if self.population_diversity else 0,
-                'total_generations': len(self.best_scores_per_generation),
-                'best_generation_score': max(self.best_scores_per_generation) if self.best_scores_per_generation else 0
+                'best_generation_score': max([g['max_score'] for g in self.generation_stats]) if self.generation_stats else 0
             }
         }
         
@@ -359,10 +438,14 @@ class GameStatistics:
         print("\nTraining Summary:")
         print("=" * 50)
         print(f"Total Episodes: {len(self.scores)}")
+        print(f"Total Generations: {len(self.generation_stats)}")
         print(f"Total Moves: {self.moves}")
         print(f"Final Score: {self.scores[-1] if self.scores else 0}")
         print(f"Best Score: {max(self.scores) if self.scores else 0}")
         print(f"Average Score: {np.mean(self.scores) if self.scores else 0:.2f}")
+        if self.generation_stats:
+            print(f"Latest Generation Average: {self.generation_stats[-1]['avg_score']:.2f}")
+            print(f"Latest Generation Best: {self.generation_stats[-1]['max_score']}")
         print(f"Total Lines Cleared: {sum(self.lines_cleared)}")
         print(f"Average Lines per Episode: {np.mean(self.lines_cleared) if self.lines_cleared else 0:.2f}")
         print(f"Training Duration: {self.game_duration:.2f} seconds")

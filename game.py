@@ -3,6 +3,7 @@ import pygame
 import numpy as np
 import torch
 import time
+import random
 from grid import create_grid, is_valid_position, clear_tetromino_from_grid, place_tetromino_on_grid, check_completed_rows, clear_rows
 from tetromino import spawn_tetromino, TETROMINOES
 from graphics import (
@@ -69,26 +70,30 @@ def game_loop():
     
     # Try to load previous state
     try:
-        ai.load_state('tetris_genetic_state.pth')
-        print(f"Loaded previous state - Generation: {ai.generation}, Member: {ai.current_member}")
-    except FileNotFoundError:
-        print("Starting fresh training session")
-        ai.save_state('tetris_genetic_state.pth')  # Create initial save
+        print("\n=== Initializing Game ===")
+        print("Attempting to load previous state...")
+        if os.path.exists('models/tetris_genetic_state.pth'):
+            ai.load_state('tetris_genetic_state.pth')
+            print(f"Loaded state - Generation: {ai.generation}, Member: {ai.current_member}")
+        else:
+            print("No previous state found, starting fresh")
+    except Exception as e:
+        print(f"Error loading state: {e}")
+        print("Starting fresh")
     
-    # Initialize statistics and visualization
     metrics_visualizer = MetricsVisualizer()
     stats = GameStatistics()
-    
     running = True
-    session_start_time = time.time()
-    last_save_time = session_start_time
+    last_save_time = time.time()
 
-    print(f"\nStarting training session:")
+    print(f"\nInitial State:")
     print(f"Generation: {ai.generation}")
     print(f"Current Member: {ai.current_member + 1}/{ai.population_size}")
 
     while running:
         # Initialize game state for current member
+        print(f"\n=== Starting Game for Generation {ai.generation}, Member {ai.current_member + 1}/{ai.population_size} ===")
+        
         game_state = {
             'grid': create_grid(),
             'score': 0,
@@ -118,7 +123,6 @@ def game_loop():
             'rotation': 0
         }
 
-        # Initial piece spawn
         next_piece['key'], next_piece['tetromino'], next_piece['rotation'] = spawn_tetromino()
         current_piece['key'], current_piece['tetromino'], current_piece['rotation'] = spawn_tetromino()
         current_piece['position'] = (game_state['grid'].shape[1] // 2 - 2, 0)
@@ -136,7 +140,7 @@ def game_loop():
                         running = False
                     elif event.key == pygame.K_s:
                         ai.save_state('tetris_genetic_state.pth')
-                        print("Manual state save triggered")
+                        print("\nManual state save triggered")
                     elif event.key == pygame.K_p:
                         paused = True
                         while paused and running:
@@ -165,6 +169,8 @@ def game_loop():
                 possible_moves = get_possible_moves(game_state['grid'], current_piece['key'], 
                                                   current_piece['tetromino'])
 
+                print(f"\nFound {len(possible_moves)} possible moves for piece {current_piece['key']}")
+
                 if not possible_moves:
                     print(f"Game Over - No valid moves available")
                     game_active = False
@@ -190,9 +196,10 @@ def game_loop():
                     game_active = False
                     continue
 
-                # Place piece and process results
+                # Place piece and update AI's grid state
                 place_tetromino_on_grid(game_state['grid'], current_piece['tetromino'], 
                                       current_piece['position'])
+                ai.current_grid = game_state['grid'].copy()
                 
                 # Check for completed rows
                 completed_rows = check_completed_rows(game_state['grid'])
@@ -200,7 +207,10 @@ def game_loop():
                     lines_cleared = len(completed_rows)
                     game_state['lines_cleared'] += lines_cleared
                     game_state['score'] += lines_cleared * 100
+                    if lines_cleared == 4:
+                        game_state['score'] += 400  # Bonus for Tetris
                     game_state['grid'] = clear_rows(game_state['grid'], completed_rows)
+                    print(f"\nCleared {lines_cleared} lines! Total score: {game_state['score']}")
 
                 # Update piece statistics
                 game_state['piece_stats']['total_pieces'] += 1
@@ -216,7 +226,7 @@ def game_loop():
                         if game_state['grid'][y][x] != 0:
                             if not found_block:
                                 heights[x] = game_state['grid'].shape[0] - y
-                                found_block = True
+                            found_block = True
                         elif found_block:
                             holes += 1
 
@@ -239,14 +249,14 @@ def game_loop():
 
                 game_state['last_move_time'] = current_time
 
-                # Update visualizer
-                metrics_visualizer.update(
-                    score=game_state['score'],
-                    fitness=0,  # Will be calculated at game end
-                    lines=game_state['lines_cleared'],
-                    height=game_state['max_height'],
-                    holes=game_state['holes']
-                )
+            # Update visualizer
+            metrics_visualizer.update(
+                score=game_state['score'],
+                fitness=0,  # Will be calculated at game end
+                lines=game_state['lines_cleared'],
+                height=game_state['max_height'],
+                holes=game_state['holes']
+            )
 
             # Draw game state
             screen.fill(BLACK)
@@ -278,6 +288,11 @@ def game_loop():
 
         # Game over - Process results
         if not game_active:
+            print("\n=== Game Over ===")
+            print(f"Final Score: {game_state['score']}")
+            print(f"Lines Cleared: {game_state['lines_cleared']}")
+            print(f"Total Moves: {game_state['moves']}")
+            
             # Update AI
             fitness = ai.add_fitness_score(
                 score=game_state['score'],
@@ -299,9 +314,10 @@ def game_loop():
             )
             stats.update(metrics)
 
-            # Periodic saves and reports
+            # Periodic saves
             current_time = time.time()
             if current_time - last_save_time > 300:  # Save every 5 minutes
+                print("\nPerforming periodic save...")
                 stats.generate_enhanced_plots()
                 stats.save_statistics()
                 ai.save_state('tetris_genetic_state.pth')
@@ -310,6 +326,7 @@ def game_loop():
             pygame.time.wait(500)  # Brief pause between games
 
     # Final cleanup
+    print("\n=== Training Session Complete ===")
     stats.generate_enhanced_plots()
     stats.save_statistics()
     stats.print_training_summary()
